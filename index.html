@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spheres of Chaos — Mini Prototype</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="hud">
+    <div id="score">Score: 0</div>
+    <div id="lives">Lives: 3</div>
+   <div class="energy">
+    <div class="energy__bar">
+      <div class="energy__fill" id="energyFill"></div>
+    </div>
+  </div>
+  </div>
+  <div id="help">Q = Change Weapon • T = Change Theme</div>
+    
+
+  <!-- Import your JS last so DOM elements exist -->
+<script src="game.js" defer></script>
+</body>
+</html>
+
