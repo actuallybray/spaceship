@@ -70,6 +70,14 @@
       }
     }
 
+    // tanks (multi-hit)
+    if (state.tanks) {
+      for (const t of state.tanks) {
+        const d2 = sqr(t.x - x) + sqr(t.y - y);
+        if (d2 < bestD2) { bestD2 = d2; best = { type: 'tank', ref: t }; }
+      }
+    }
+
     // radius gate
     if (best && Math.sqrt(bestD2) <= params.homingAcquireRadius) return best;
     return null;
@@ -88,6 +96,7 @@
     bullets: [],
     spheres: [],
     hunters: [],          // new enemy type
+    tanks: [],            // multi-hit enemy
     particles: [],        // includes RCS pulses (type:'rcs')
     collectibles: [],
     shockwaves: [],
@@ -104,6 +113,10 @@
     prevUpdateAt: 0,  // for dt-based regen
     energy: 100,          // %
     nextCollectibleAt: 0, // ms timestamp
+    plumeLen: 0,
+    plumeBend: 0,
+    angVel: 0,
+    prevAngle: 0,
 
     activeWeapon: 0,   // index into state.weapons
     weapons: ['bullet', 'fan', 'homing'], // start with two
@@ -112,6 +125,13 @@
     showWaveUntil: 0,
     waveMsg: '',
     waveStartAt: 0,
+
+    // --- Director state ---
+    spawnQueue: [],           // timed phase spawns
+    waveActiveSince: 0,       // ms timestamp when wave enemies start
+    waveDeaths: 0,            // deaths during current wave
+    lastWaveStats: { clearMs: 0, deaths: 0 },
+    difficultyScalar: 1.0,    // adaptive scaling 0.7..1.6
   };
 
   // ==============================
@@ -126,16 +146,21 @@
     r: 12,
   };
 
+  // Ship collision helper (slightly larger than visual hull)
+  function getShipHitR(){
+    return (params.shipHitScale ?? 1.35) * ship.r;
+  }
+
   // ==============================
   // Tunables / Params
   // ==============================
   const params = {
     // Movement
-    thrust: 0.18,
-    reverseThrust: 0.09,
-    rotSpeed: 0.09,
-    maxSpeed: 10,
-    friction: 0.992,
+    thrust: 0.25, //default 0.18
+    reverseThrust: 0.1, //default 0.09
+    rotSpeed: 0.1, //defaul 0.09
+    maxSpeed: 15,  //default 10
+    friction: 0.990, //default 0.992
 
     // Weapons
     bulletSpeed: 14,
@@ -162,6 +187,7 @@
     
     // Spheres
     sphereMinR: 24,
+    sphereMaxR: 110,         // allow larger spheres for higher threat
     sphereSplitFactor: 0.65,
     sphereCountBase: 5,
     sphereWaveGrowth: 2,
@@ -194,9 +220,26 @@
     hunterChargeDrag: 0.997,        // drag during charge (small)
     hunterRecoverDrag: 0.985,       // brief heavier drag right after charge
 
+    // --- Tanks (multi-hit enemies) ---
+    tankRMin: 22,
+    tankRMax: 30,
+    tankHp: 4,
+    tankSpeedMin: 0.4,
+    tankSpeedMax: 1.2,
+    tankScore: 60,
+    tankShockwaveDamage: 2,   // shockwave damage to tanks (hp)
+
+    // --- Director difficulty scaling ---
+    budgetBase: 12,     // previously 8
+    budgetA: 5,         // previously 3
+    budgetB: 0.9,       // previously 0.5
+    budgetMult: 1.15,   // global multiplier
+    directorHunterCapFrac: 0.5, // fraction of budget cost allowed for hunters
+
 
     // Player
     invulnAfterHitMs: 2000,
+    shipHitScale: 1.15,    // collision radius multiplier vs ship.r
 
 
     // Charge / shockwave
@@ -226,11 +269,20 @@
     rcsPuffCooldown: 120,
     rcsPulseLength: 12,
 
+    // Engine plume
+    plumeBaseLen: 42,
+    plumeMaxLen: 160,
+    plumeWidth: 16,
+    plumeLerp: 0.18,
+    plumeCurveFrac: 0.28,   // fraction of length used as max bend cap
+    plumeVelBias: 0.45,     // how much velocity lateral component bends
+    plumeTurnBias: 0.25,    // how much turning rate bends
+
     // RCS placement (positions)
     rcsOffsets: {
-      left:  { fwd: 16, side: 16 },
-      right: { fwd: 16, side: 16 },
-      nose:  { fwd: 6 }
+      left:  { fwd: 19, side: 16 },
+      right: { fwd: 19, side: 16 },
+      nose:  { fwd: 9 }
     },
 
     // RCS angles (directions relative to ship.a)
@@ -283,6 +335,12 @@
       shipOutline: '#ffffff44',
       bullet: '#ffffff',
       hunter: '#f96262ff',
+      tankBase: '#6acbff',
+      plumeTop: '#c97320',
+      plumeMid: '#5a2a00',
+      sphereAlbedo: '#d9c6d3',
+      sphereShadow: '#2e2a2e',
+      sphereSpec:   '#ffe9ff',
       engineFlame: '#ffd166',
       rcs: '#eaf7ff50',
       explosion: '#ffd166',
@@ -295,6 +353,12 @@
       shipOutline: '#00cc77',
       bullet: '#00ffcc',
       hunter: '#f96262ff',
+      tankBase: '#66ffaa',
+      plumeTop: '#8ccf6a',
+      plumeMid: '#2e5a2a',
+      sphereAlbedo: '#a9f0c9',
+      sphereShadow: '#0f2b19',
+      sphereSpec:   '#eafff4',
       engineFlame: '#00ff55',
       rcs: '#55ffaa50',
       explosion: '#00ff55',
@@ -305,17 +369,36 @@
     synthwave: {
       ship: '#ff6ad5',
       shipOutline: '#ff2e97',
-      bullet: '#ffffff',
+      bullet: '#ff9150',
       hunter: '#f96262ff',
+      tankBase: '#6affff',
+      plumeTop: '#ff9150',
+      plumeMid: '#4a210b',
+      sphereAlbedo: '#F1D2E3',
+      sphereShadow: '#292929',
+      sphereSpec:   '#F1D2E3',
       engineFlame: '#ffb86c',
-      rcs: '#6affff50',
+      rcs: '#ffffff50',
       explosion: '#ff6ad5',
       sphereGradient: ['#ff6ad5', '#9d6cff', '#6affff'],
       sphereOutline: '#ff2e97',
-      bg: '#1a0033',
+      bg: '#292929',
     },
   };
   let colors = themes.synthwave;
+
+  // ==============================
+  // Assets (SVG ship)
+  // ==============================
+  const shipImg = new Image();
+  let shipImgReady = false;
+  let shipImgW = 48, shipImgH = 48; // sensible defaults if SVG lacks size
+  shipImg.onload = () => {
+    shipImgReady = true;
+    shipImgW = shipImg.naturalWidth || shipImg.width || 48;
+    shipImgH = shipImg.naturalHeight || shipImg.height || 48;
+  };
+  shipImg.src = 'ship.svg';
 
   // ==============================
   // UI hooks
@@ -348,6 +431,7 @@ function setEnergy(v){
 
   function loseLife() {
     state.lives--;
+    state.waveDeaths = (state.waveDeaths || 0) + 1;
     if (livesEl) livesEl.textContent = `Lives: ${state.lives}`;
     state.invulnUntil = performance.now() + params.invulnAfterHitMs;
     resetShip();
@@ -493,6 +577,179 @@ function spawnHunters(n = 1) {
   }
 }
 
+// --- Hunter (single) helper for pattern placement ---
+function spawnHunterAt(x, y) {
+  const now = performance.now();
+  const spd = Number.isFinite(params.hunterSpeed) && params.hunterSpeed > 0 ? params.hunterSpeed : 1.6;
+  let a = rand(0, TAU);
+  let vx = Math.cos(a) * spd;
+  let vy = Math.sin(a) * spd;
+  if (Math.abs(vx) + Math.abs(vy) < 0.001) {
+    a = rand(0, TAU);
+    vx = Math.cos(a) * spd;
+    vy = Math.sin(a) * spd;
+  }
+  state.hunters.push({
+    x, y, vx, vy,
+    r: params.hunterR ?? 10,
+    spawnGraceUntil: now + (params.hunterSpawnGraceMs ?? 800),
+    seed: Math.random() * 1000,
+    wanderTheta: rand(0, TAU),
+    mode: 'seek',
+    lockA: 0,
+    windupUntil: 0,
+    chargeUntil: 0,
+    nextChargeAt: now + rand(600, 1400),
+    lastX: x, lastY: y, stuckCheckAt: now + 800,
+  });
+}
+
+// --- Spheres helper for explicit positions/sizes ---
+function spawnSphereAt(x, y, size) {
+  const now = performance.now();
+  const minR = params.sphereMinR ?? 24;
+  const maxR = params.sphereMaxR ?? 80;
+  let rMin, rMax;
+  if (size === 'L') { rMin = Math.min(maxR, minR + 18); rMax = Math.min(maxR, minR + 28); }
+  else if (size === 'M') { rMin = minR + 8; rMax = Math.min(maxR, minR + 16); }
+  else { rMin = minR; rMax = Math.min(maxR, minR + 6); }
+  const R = rand(rMin, rMax);
+  const spd = rand(0.6, 2.2);
+  const dir = rand(0, TAU);
+  state.spheres.push({
+    x, y,
+    vx: Math.cos(dir) * spd,
+    vy: Math.sin(dir) * spd,
+    r: R,
+    m: R * R,
+    spawnGraceUntil: now + (params.sphereSpawnGraceMs ?? 900),
+  });
+}
+
+function spawnTankAt(x, y) {
+  const now = performance.now();
+  const r = rand(params.tankRMin ?? 22, params.tankRMax ?? 30);
+  const spd = rand(params.tankSpeedMin ?? 0.4, params.tankSpeedMax ?? 1.0);
+  const dir = rand(0, TAU);
+  const maxHp = Math.max(2, params.tankHp | 0);
+  state.tanks.push({
+    x, y,
+    vx: Math.cos(dir) * spd,
+    vy: Math.sin(dir) * spd,
+    r,
+    hp: maxHp,
+    maxHp,
+    spawnGraceUntil: now + (params.sphereSpawnGraceMs ?? 900),
+  });
+}
+
+// ==============================
+// Director: budgets, phases and patterns
+// ==============================
+function waveBudget(w) {
+  const base = params.budgetBase ?? 8;
+  const a    = params.budgetA    ?? 3;
+  const b    = params.budgetB    ?? 0.5;
+  const mult = params.budgetMult ?? 1;
+  return Math.max(4, (base + a * w + b * w * w) * mult);
+}
+
+function clampDiff(x) { return clamp(x, 0.7, 1.6); }
+
+function buildPhasePayload(budget, hunterCapRemaining) {
+  // costs
+  const COST = { S: 2, M: 4, L: 7, H: 6, T: 8 };
+  let rem = Math.max(0, Math.floor(budget));
+  const out = { S: 0, M: 0, L: 0, H: 0, T: 0 };
+
+  while (rem >= Math.min(COST.S, COST.H)) {
+    // candidates under budget and respecting hunter cap
+    const cand = [];
+    if (rem >= COST.S) cand.push('S');
+    if (rem >= COST.M) cand.push('M');
+    if (rem >= COST.L) cand.push('L');
+    if (rem >= COST.H && hunterCapRemaining > 0) cand.push('H');
+    if (rem >= COST.T) cand.push('T');
+    if (cand.length === 0) break;
+
+    // simple weights to vary mix a bit
+    const weights = { S: 5, M: 3, L: 2, H: 3, T: 2 };
+    const pickFrom = cand.flatMap(k => Array(weights[k]).fill(k));
+    const k = pickFrom[Math.floor(rand(0, pickFrom.length))];
+
+    out[k]++;
+    rem -= COST[k];
+    if (k === 'H') hunterCapRemaining--;
+  }
+
+  // ensure key present for T even if 0
+  return { payload: { S: out.S||0, M: out.M||0, L: out.L||0, H: out.H||0, T: out.T||0 }, hunterCapRemaining };
+}
+
+function shuffledTypesFromPayload(payload) {
+  const arr = [];
+  for (let i = 0; i < payload.S; i++) arr.push('S');
+  for (let i = 0; i < payload.M; i++) arr.push('M');
+  for (let i = 0; i < payload.L; i++) arr.push('L');
+  for (let i = 0; i < payload.H; i++) arr.push('H');
+  for (let i = 0; i < payload.T; i++) arr.push('T');
+  // shuffle
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function patternScatter(payload) {
+  const types = shuffledTypesFromPayload(payload);
+  for (const t of types) {
+    const pt = safeRandomPointAwayFromShip(params.safeSpawnRadius ?? 260);
+    if (t === 'H') spawnHunterAt(pt.x, pt.y);
+    else if (t === 'T') spawnTankAt(pt.x, pt.y);
+    else spawnSphereAt(pt.x, pt.y, t);
+  }
+}
+
+function patternRing(payload) {
+  const types = shuffledTypesFromPayload(payload);
+  if (types.length === 0) return;
+  const w = canvas.width / dpr(), h = canvas.height / dpr();
+  const R = Math.min(Math.min(w, h) * 0.42, (params.safeSpawnRadius ?? 260) + 120);
+  const startA = rand(0, TAU);
+  const cx = ship.x, cy = ship.y;
+  for (let i = 0; i < types.length; i++) {
+    const a = startA + (i / types.length) * TAU;
+    const x = ((cx + Math.cos(a) * R) + w) % w;
+    const y = ((cy + Math.sin(a) * R) + h) % h;
+    const t = types[i];
+    if (t === 'H') spawnHunterAt(x, y);
+    else if (t === 'T') spawnTankAt(x, y);
+    else spawnSphereAt(x, y, t);
+  }
+}
+
+function patternPincer(payload) {
+  const types = shuffledTypesFromPayload(payload);
+  if (types.length === 0) return;
+  const w = canvas.width / dpr(), h = canvas.height / dpr();
+  const R = Math.min(Math.min(w, h) * 0.5, (params.safeSpawnRadius ?? 260) + 140);
+  const base = rand(0, TAU);
+  const sides = [base, base + Math.PI];
+  for (let i = 0; i < types.length; i++) {
+    const side = sides[i % 2];
+    const jitter = rand(-0.35, 0.35);
+    const a = side + jitter;
+    const cx = ship.x, cy = ship.y;
+    const x = ((cx + Math.cos(a) * R) + w) % w;
+    const y = ((cy + Math.sin(a) * R) + h) % h;
+    const t = types[i];
+    if (t === 'H') spawnHunterAt(x, y);
+    else if (t === 'T') spawnTankAt(x, y);
+    else spawnSphereAt(x, y, t);
+  }
+}
+
 function announceWave() {
   state.waveMsg = `Wave ${state.wave}`;
   state.showWaveUntil = performance.now() + (params.waveBannerMs ?? 1200);
@@ -502,59 +759,50 @@ function spawnWave() {
   // clear previous wave
   state.spheres.length      = 0;
   state.hunters.length      = 0;
+  state.tanks.length        = 0;
   state.collectibles.length = 0;
+  state.spawnQueue.length   = 0;
 
   const w = canvas.width / dpr(), h = canvas.height / dpr();
   const now = performance.now();
 
-  // --- Spheres ---
-  const count = (params.sphereCountBase ?? 6) + (state.wave - 1) * (params.sphereWaveGrowth ?? 0);
-  const safeR = params.safeSpawnRadius ?? 260;
-  const maxTries = params.sphereSpawnMaxTries ?? 80;
+  // --- Director: phased spawn scheduling ---
+  const rawBudget = waveBudget(state.wave) * state.difficultyScalar * rand(0.9, 1.1);
+  const budget = Math.max(4, Math.floor(rawBudget));
 
-  for (let i = 0; i < count; i++) {
-    let x, y, ok = false, tries = 0;
+  // hunter cap: at most 40% of cost spent on hunters
+  const H_COST = 6; // must match buildPhasePayload
+  const hunterFrac = params.directorHunterCapFrac ?? 0.4;
+  let hunterCapRemaining = Math.floor((budget * hunterFrac) / H_COST);
 
-    while (tries++ < maxTries) {
-      x = rand(0, w); y = rand(0, h);
-      if (Math.hypot(x - ship.x, y - ship.y) >= safeR) { ok = true; break; }
+  const phases = state.wave >= 3 ? 3 : 2;
+  const fracs = phases === 3 ? [0.45, 0.35, 0.20] : [0.6, 0.4];
+  const gap = 4500; // ms between phases
+
+  let firstAt = now;
+  for (let i = 0; i < phases; i++) {
+    const pBudget = Math.max(2, Math.floor(budget * fracs[i]));
+    const built = buildPhasePayload(pBudget, hunterCapRemaining);
+    hunterCapRemaining = built.hunterCapRemaining;
+
+    // pick a pattern with simple weights (more scatter early)
+    const roll = Math.random();
+    let pattern = 'scatter';
+    if (phases === 3) {
+      if (i === 1 && roll < 0.6) pattern = 'ring';
+      if (i === 2 && roll < 0.7) pattern = 'pincer';
+    } else {
+      if (i === 1 && roll < 0.5) pattern = 'ring';
     }
 
-    if (!ok) {
-      // fallback ring but use modulo wrap so we don’t pin to edges/corners
-      const ang = rand(0, TAU);
-      const r   = safeR + 40;
-      x = (ship.x + Math.cos(ang) * r + w) % w;
-      y = (ship.y + Math.sin(ang) * r + h) % h;
-    }
-
-    const R   = rand(params.sphereMinR ?? 40, params.sphereMaxR ?? 80);
-    const spd = rand(0.6, 2.2);
-    const dir = rand(0, TAU);
-
-    state.spheres.push({
-      x, y,
-      vx: Math.cos(dir) * spd,
-      vy: Math.sin(dir) * spd,
-      r: R,
-      m: R * R,
-      spawnGraceUntil: now + (params.sphereSpawnGraceMs ?? 900),
-    });
+    const at = now + i * gap;
+    if (i === 0) firstAt = at;
+    state.spawnQueue.push({ at, pattern, payload: built.payload });
   }
 
-  // --- Hunters (spawn after spheres) ---
-  const hCount = (params.hunterCountBase ?? 0) + (state.wave - 1) * (params.hunterWaveGrowth ?? 0);
-  if (hCount > 0) spawnHunters(hCount);
+  state.waveActiveSince = firstAt;
 
-  // --- First collectible timer for this wave ---
-  state.nextCollectibleAt = now + rand(
-    params.collectibleSpawnMinMs ?? 1500,
-    params.collectibleSpawnMaxMs ?? 3500
-  );
-
-  // --- Wave banner + invulnerability ---
-  announceWave();
-  state.invulnUntil = now + (params.waveStartInvulnMs ?? 1500);
+  // collectibles timing set by update() right after spawning starts
 }
 
 // Timed single collectible
@@ -747,6 +995,40 @@ function spawnOneCollectible() {
     ctx.stroke();
   }
 
+  function drawEnginePlume(len, width, bend) {
+    // Draw a vertical rounded rectangle plume behind the ship (negative X)
+    const w = Math.max(2, width);
+    const L = Math.max(0, len);
+    if (L <= 0) return;
+
+    // Gradient from near ship (-12) backward to -12 - L
+    const x0 = -12, x1 = -12 - L;
+    const g = ctx.createLinearGradient(x0, 0, x1, 0);
+    const top = colors.plumeTop || '#c97320';
+    const mid = colors.plumeMid || '#5a2a00';
+    g.addColorStop(0.0, top + 'ee');
+    g.addColorStop(0.5, mid + 'aa');
+    g.addColorStop(1.0, '#00000000');
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g;
+    // Curved plume: quadratic curves with bend offset (positive bends downward)
+    const b = bend || 0;
+    const cpX = x0 - L * 0.6;
+    ctx.beginPath();
+    // top edge (start centered near the ship, end offset by bend)
+    ctx.moveTo(x0, -w/2);
+    ctx.quadraticCurveTo(cpX, -w/2 + b, x1, -w/2 + b);
+    // far end down to bottom edge (same bend sign to shift centerline)
+    ctx.lineTo(x1,  w/2 + b);
+    // bottom edge back
+    ctx.quadraticCurveTo(cpX,  w/2 + b, x0,  w/2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
   // ==============================
   // Loop
   // ==============================
@@ -768,6 +1050,14 @@ function update(now) {
     state.lastRotPuffAt = now;
     if (rotatingRight) state.particles.push({ type: 'rcs', kind: 'right', born: now, life: 110 });
     if (rotatingLeft)  state.particles.push({ type: 'rcs', kind: 'left',  born: now, life: 110 });
+  }
+
+  // Angular velocity for plume bending
+  {
+    const prevA = state.prevAngle || ship.a;
+    const dA = Math.atan2(Math.sin(ship.a - prevA), Math.cos(ship.a - prevA));
+    state.angVel = dA;
+    state.prevAngle = ship.a;
   }
 
   // --- Main engine
@@ -797,6 +1087,23 @@ function update(now) {
   ship.x  += ship.vx; ship.y += ship.vy;
   ship.vx *= params.friction; ship.vy *= params.friction;
   hardWrap(ship, w, h);
+
+  // --- Drain scheduled spawn phases ---
+  if (state.spawnQueue.length > 0) {
+    // handle any phases due
+    const due = [];
+    for (let i = state.spawnQueue.length - 1; i >= 0; i--) {
+      if (state.spawnQueue[i].at <= now) {
+        due.push(state.spawnQueue[i]);
+        state.spawnQueue.splice(i, 1);
+      }
+    }
+    for (const phase of due) {
+      if (phase.pattern === 'ring') patternRing(phase.payload);
+      else if (phase.pattern === 'pincer') patternPincer(phase.payload);
+      else patternScatter(phase.payload);
+    }
+  }
 
   // =========================================================
   // Bullets (normal + homing)  <— this replaces the stray 'b' block
@@ -855,6 +1162,12 @@ function update(now) {
   for (const s of state.spheres) {
     s.x += s.vx; s.y += s.vy;
     hardWrap(s, w, h);
+  }
+
+  // --- Tanks move
+  for (const t of state.tanks) {
+    t.x += t.vx; t.y += t.vy;
+    hardWrap(t, w, h);
   }
 
   /// --- Hunters: seek + wander + separation + charge
@@ -1041,6 +1354,21 @@ for (let i = 0; i < state.hunters.length; i++) {
       addScore(params.hunterScore || 25);
     }
   }
+
+  // tanks: deal fixed damage per pass through ring band
+  for (let ti = state.tanks.length - 1; ti >= 0; ti--) {
+    const tnk = state.tanks[ti];
+    if (now <= (tnk.spawnGraceUntil || 0)) continue;
+    const d = Math.hypot(tnk.x - cx, tnk.y - cy);
+    if (d <= outerR + tnk.r && d >= hitInnerR - tnk.r) {
+      tnk.hp -= (params.tankShockwaveDamage || 2);
+      if (tnk.hp <= 0) {
+        state.tanks.splice(ti, 1);
+        burst(tnk.x, tnk.y, 16, colors.rcs);
+        addScore(params.tankScore || 60);
+      }
+    }
+  }
 }
 
 
@@ -1104,6 +1432,24 @@ for (let i = 0; i < state.hunters.length; i++) {
     }
   }
 
+  // --- Bullets vs tanks (multi-hit)
+  for (let i = state.tanks.length - 1; i >= 0; i--) {
+    const tnk = state.tanks[i];
+    for (let j = state.bullets.length - 1; j >= 0; j--) {
+      const b = state.bullets[j];
+      if (circlePointHit(tnk.x, tnk.y, tnk.r, b.x, b.y)) {
+        state.bullets.splice(j, 1);
+        tnk.hp -= 1;
+        if (tnk.hp <= 0) {
+          state.tanks.splice(i, 1);
+          burst(tnk.x, tnk.y, 14);
+          addScore(params.tankScore || 60);
+        }
+        break;
+      }
+    }
+  }
+
   // --- Bullets vs hunters
   for (let i = state.hunters.length - 1; i >= 0; i--) {
     const htr = state.hunters[i];
@@ -1126,7 +1472,7 @@ for (let i = 0; i < state.hunters.length; i++) {
   if (now > state.invulnUntil) {
     for (const s of state.spheres) {
       if (now <= (s.spawnGraceUntil || 0)) continue;
-      if (circleCircleHit({ x: ship.x, y: ship.y, r: ship.r * 0.85 }, s)) {
+      if (circleCircleHit({ x: ship.x, y: ship.y, r: getShipHitR() }, s)) {
         burst(ship.x, ship.y, 24);
         loseLife();
         break;
@@ -1134,7 +1480,7 @@ for (let i = 0; i < state.hunters.length; i++) {
     }
     for (const h of state.hunters) {
       if (now <= (h.spawnGraceUntil || 0)) continue;
-      if (circleCircleHit({ x: ship.x, y: ship.y, r: ship.r * 0.85 }, { x: h.x, y: h.y, r: h.r })) {
+      if (circleCircleHit({ x: ship.x, y: ship.y, r: getShipHitR() }, { x: h.x, y: h.y, r: h.r })) {
         const charging = h.mode === 'charge';
         burst(ship.x, ship.y, charging ? 36 : 24);
         loseLife();
@@ -1150,6 +1496,14 @@ for (let i = 0; i < state.hunters.length; i++) {
         break;
       }
     }
+    for (const t of state.tanks) {
+      if (now <= (t.spawnGraceUntil || 0)) continue;
+      if (circleCircleHit({ x: ship.x, y: ship.y, r: getShipHitR() }, { x: t.x, y: t.y, r: t.r })) {
+        burst(ship.x, ship.y, 28);
+        loseLife();
+        break;
+      }
+    }
   }
 
   // --- Ship collects energy pickups
@@ -1158,7 +1512,7 @@ for (let i = 0; i < state.hunters.length; i++) {
     const t = (now - c.born) / 1000;
     const r = params.collectibleBaseR +
               Math.sin(t * params.collectiblePulseSpeed) * params.collectiblePulseAmp;
-    if (circleCircleHit({ x: ship.x, y: ship.y, r: ship.r * 0.85 }, { x: c.x, y: c.y, r })) {
+    if (circleCircleHit({ x: ship.x, y: ship.y, r: getShipHitR() }, { x: c.x, y: c.y, r })) {
       addScore(params.collectibleScore);
       state.collected++;
       burst(c.x, c.y, 10, colors.rcs);
@@ -1194,13 +1548,26 @@ for (let i = 0; i < state.hunters.length; i++) {
 
 
   // --- Wave scheduling
-  if (state.spheres.length === 0 && state.hunters.length === 0 && state.collectibles.length === 0 && state.waveStartAt === 0) {
+  if (state.spheres.length === 0 && state.hunters.length === 0 && state.tanks.length === 0 && state.collectibles.length === 0 && state.spawnQueue.length === 0 && state.waveStartAt === 0) {
+    // collect stats and adapt difficulty
+    if (state.waveActiveSince) {
+      const clearMs = now - state.waveActiveSince;
+      state.lastWaveStats = { clearMs, deaths: state.waveDeaths };
+      let s = state.difficultyScalar;
+      if (state.waveDeaths > 0) s *= 0.9;
+      else if (clearMs < 12000) s *= 1.08;
+      else if (clearMs > 28000) s *= 0.95;
+      state.difficultyScalar = clampDiff(s);
+      state.waveDeaths = 0;
+      state.waveActiveSince = 0;
+    }
+
     state.wave++;
     announceWave();
     state.waveStartAt = now + params.waveBannerMs;
     state.invulnUntil = state.waveStartAt + params.invulnAfterSpawnMs;
   }
-  if (state.waveStartAt && now >= state.waveStartAt && state.spheres.length === 0 && state.hunters.length === 0) {
+  if (state.waveStartAt && now >= state.waveStartAt && state.spheres.length === 0 && state.hunters.length === 0 && state.tanks.length === 0) {
     spawnWave();
     state.waveStartAt = 0;
     state.nextCollectibleAt = now + rand(params.collectibleSpawnMinMs, params.collectibleSpawnMaxMs);
@@ -1314,15 +1681,44 @@ for (let i = 0; i < state.hunters.length; i++) {
     //   ctx.restore();
     // }
 
-    // Spheres
+    // Spheres (single radial gradient only)
     for (const s of state.spheres) {
-      const g = ctx.createRadialGradient(s.x, s.y, 2, s.x, s.y, s.r);
-      g.addColorStop(0, colors.sphereGradient[0]);
-      g.addColorStop(0.6, colors.sphereGradient[1]);
-      g.addColorStop(1, colors.sphereGradient[2]);
+      const r = s.r;
+      // light direction (screen space): towards bottom-right
+      const lx = 0.78, ly = 0.62;
+      const phx = s.x + lx * r * 0.38;
+      const phy = s.y + ly * r * 0.38;
+
+      // single diffuse radial gradient, no outlines or linear fades
+      const g = ctx.createRadialGradient(phx, phy, r * 0.0, s.x, s.y, r);
+      g.addColorStop(0,   colors.sphereAlbedo || '#cfb0d8');
+      g.addColorStop(1.0, colors.sphereShadow || '#24112d');
       ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, TAU); ctx.fill();
-      ctx.strokeStyle = colors.sphereOutline; ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, r, 0, TAU);
+      ctx.fill();
+    }
+
+    // Tanks (multi-hit) — color shifts towards red as hp drops
+    const RED = { r: 255, g: 77, b: 77 };
+    function hexToRgb(hex){
+      const s = hex.replace('#','');
+      const n = parseInt(s.length===3 ? s.split('').map(c=>c+c).join('') : s, 16);
+      return { r: (n>>16)&255, g: (n>>8)&255, b: n&255 };
+    }
+    function rgbToHex({r,g,b}){
+      const to = (v)=> v.toString(16).padStart(2,'0');
+      return `#${to(r)}${to(g)}${to(b)}`;
+    }
+    function mix(a,b,t){ return { r: Math.round(a.r+(b.r-a.r)*t), g: Math.round(a.g+(b.g-a.g)*t), b: Math.round(a.b+(b.b-a.b)*t) }; }
+
+    const baseTankRGB = hexToRgb(colors.tankBase || '#6affff');
+    for (const t of state.tanks) {
+      const dmg = 1 - (t.hp / t.maxHp);
+      const col = mix(baseTankRGB, RED, clamp(dmg, 0, 1));
+      ctx.fillStyle = rgbToHex(col);
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, TAU); ctx.fill();
+      ctx.strokeStyle = colors.shipOutline; ctx.stroke();
     }
 
 
@@ -1429,26 +1825,48 @@ if (now >= (h.stuckCheckAt || 0)) {
       ctx.strokeStyle = colors.shipOutline; ctx.stroke();
     }
 
-    // Ship
+    // Ship (SVG with canvas effects fallback)
     ctx.save();
     ctx.translate(ship.x, ship.y);
     ctx.rotate(ship.a);
     const inv = performance.now() < state.invulnUntil;
     ctx.globalAlpha = inv ? 0.5 : 1;
 
-    ctx.beginPath();
-    ctx.moveTo(14, 0); ctx.lineTo(-12, -9); ctx.lineTo(-6, 0); ctx.lineTo(-12, 9); ctx.closePath();
-    ctx.fillStyle = colors.ship; ctx.fill();
-    ctx.strokeStyle = colors.shipOutline; ctx.stroke();
+    // Engine plume behind hull (long rectangular gradient)
+    const thrusting = state.keys.has('ArrowUp') || state.keys.has('KeyW');
+    const speed = Math.hypot(ship.vx, ship.vy);
+    const base = params.plumeBaseLen ?? 42;
+    const maxL = params.plumeMaxLen ?? 160;
+    const target = thrusting ? Math.min(maxL, base + speed * 10) : 0;
+    const lerp = (params.plumeLerp ?? 0.18);
+    state.plumeLen = (state.plumeLen || 0) * (1 - lerp) + target * lerp;
 
-    // Main engine flame
-    if (state.keys.has('ArrowUp') || state.keys.has('KeyW')) {
+    // Compute lateral velocity in ship-local space (perpendicular component)
+    const ca = Math.cos(ship.a), sa = Math.sin(ship.a);
+    const localVY = -sa * ship.vx + ca * ship.vy; // +Y is to ship's right (screen-down when a≈0)
+    const vNorm = clamp(localVY / (params.maxSpeed || 10), -1, 1);
+    const wNorm = params.rotSpeed ? clamp(state.angVel / params.rotSpeed, -1, 1) : 0;
+
+    const maxBend = (params.plumeCurveFrac ?? 0.28) * state.plumeLen;
+    let bendTarget = 0;
+    if (thrusting) {
+      bendTarget = (vNorm * (params.plumeVelBias ?? 0.45) + wNorm * (params.plumeTurnBias ?? 0.25)) * state.plumeLen;
+      bendTarget = clamp(bendTarget, -maxBend, maxBend);
+    }
+    state.plumeBend = (state.plumeBend || 0) * (1 - lerp) + bendTarget * lerp;
+    drawEnginePlume(state.plumeLen, params.plumeWidth ?? 16, state.plumeBend);
+
+    if (shipImgReady) {
+      // Scale SVG to match old hull scale (ship.r ~= 12)
+      const s = ship.r / 12;
+      ctx.scale(s, s);
+      ctx.drawImage(shipImg, -shipImgW / 2, -shipImgH / 2, shipImgW, shipImgH);
+    } else {
+      // Fallback hull (original path)
       ctx.beginPath();
-      ctx.moveTo(-12, -6);
-      ctx.lineTo(-20 - Math.random() * 6, 0);
-      ctx.lineTo(-12, 6);
-      ctx.fillStyle = colors.engineFlame;
-      ctx.fill();
+      ctx.moveTo(14, 0); ctx.lineTo(-12, -9); ctx.lineTo(-6, 0); ctx.lineTo(-12, 9); ctx.closePath();
+      ctx.fillStyle = colors.ship; ctx.fill();
+      ctx.strokeStyle = colors.shipOutline; ctx.stroke();
     }
     ctx.restore();
     ctx.globalAlpha = 1;
