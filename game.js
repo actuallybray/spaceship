@@ -166,6 +166,10 @@
     bulletSpeed: 14,
     bulletCooldown: 75,
     bulletLife: 1000,
+    bulletSize: 5, // visual size in px (render only)
+    bulletTrailLen: 60,     // base trail length in px
+    bulletTrailWidth: 2,    // trail line width
+    bulletTrailSpeedMult: 0.9, // adds length based on speed
 
     // Energy regen
     energyRegenDelayMs: 500,   // wait this long after your last shot
@@ -191,11 +195,13 @@
     sphereSplitFactor: 0.65,
     sphereCountBase: 5,
     sphereWaveGrowth: 2,
+    sphereLightInnerFrac: 0.1,  // 0..1, inner radius of light in radial gradient
+    sphereLightOffset: 0.30,    // 0..1, how far toward light the gradient center is shifted
 
     // --- Hunters (chasing drones) ---
     hunterCountBase: 1,          // per wave
     hunterWaveGrowth: 1,         // +N each wave
-    hunterR: 10,                 // visual radius / hit radius
+    hunterR: 15,                 // visual radius / hit radius
     hunterWander: 0.14,          // small random jitter to avoid perfect aim
     hunterSpawnGraceMs: 900,     // can't hurt you right after spawning
     hunterScore: 30,             // points
@@ -234,12 +240,17 @@
     budgetA: 5,         // previously 3
     budgetB: 0.9,       // previously 0.5
     budgetMult: 1.15,   // global multiplier
-    directorHunterCapFrac: 0.5, // fraction of budget cost allowed for hunters
+    directorHunterCapFrac: 0.75, // fraction of budget cost allowed for hunters
 
 
     // Player
     invulnAfterHitMs: 2000,
     shipHitScale: 1.15,    // collision radius multiplier vs ship.r
+    invulnRingScale: 4,  // ring radius vs ship hit radius
+    invulnRingWidth: 1,
+    invulnRingPulseMs: 900,
+    invulnRingPulseScale: 0.03, // +- radius pulsation fraction
+    invulnRingBackPx: 4,        // offset ring center back along ship (px)
 
 
     // Charge / shockwave
@@ -270,12 +281,12 @@
     rcsPulseLength: 12,
 
     // Engine plume
-    plumeBaseLen: 42,
-    plumeMaxLen: 160,
+    plumeBaseLen: 20,
+    plumeMaxLen: 60,
     plumeWidth: 16,
-    plumeLerp: 0.18,
-    plumeCurveFrac: 0.28,   // fraction of length used as max bend cap
-    plumeVelBias: 0.45,     // how much velocity lateral component bends
+    plumeLerp: 0.10,
+    plumeCurveFrac: 0,   // fraction of length used as max bend cap (0.28)
+    plumeVelBias: 0.45,     // how much velocity lateral component bends 
     plumeTurnBias: 0.25,    // how much turning rate bends
 
     // RCS placement (positions)
@@ -290,7 +301,7 @@
       left:  -Math.PI/2 - 0.4,
       right:  Math.PI/2 + 0.4,
       nose:   0,
-      jitter: 0.20
+      jitter: 0.10
     },
 
     // Energy / ammo
@@ -341,6 +352,7 @@
       sphereAlbedo: '#d9c6d3',
       sphereShadow: '#2e2a2e',
       sphereSpec:   '#ffe9ff',
+      invulnRing: '#a3642d',
       engineFlame: '#ffd166',
       rcs: '#eaf7ff50',
       explosion: '#ffd166',
@@ -359,6 +371,7 @@
       sphereAlbedo: '#a9f0c9',
       sphereShadow: '#0f2b19',
       sphereSpec:   '#eafff4',
+      invulnRing: '#4aa06b',
       engineFlame: '#00ff55',
       rcs: '#55ffaa50',
       explosion: '#00ff55',
@@ -377,6 +390,7 @@
       sphereAlbedo: '#F1D2E3',
       sphereShadow: '#292929',
       sphereSpec:   '#F1D2E3',
+      invulnRing: '#c16a2f',
       engineFlame: '#ffb86c',
       rcs: '#ffffff50',
       explosion: '#ff6ad5',
@@ -1686,11 +1700,13 @@ for (let i = 0; i < state.hunters.length; i++) {
       const r = s.r;
       // light direction (screen space): towards bottom-right
       const lx = 0.78, ly = 0.62;
-      const phx = s.x + lx * r * 0.38;
-      const phy = s.y + ly * r * 0.38;
+      const off = params.sphereLightOffset ?? 0.38;
+      const phx = s.x + lx * r * off;
+      const phy = s.y + ly * r * off;
 
       // single diffuse radial gradient, no outlines or linear fades
-      const g = ctx.createRadialGradient(phx, phy, r * 0.0, s.x, s.y, r);
+      const innerFrac = params.sphereLightInnerFrac ?? 0.55;
+      const g = ctx.createRadialGradient(phx, phy, r * innerFrac, s.x, s.y, r);
       g.addColorStop(0,   colors.sphereAlbedo || '#cfb0d8');
       g.addColorStop(1.0, colors.sphereShadow || '#24112d');
       ctx.fillStyle = g;
@@ -1822,15 +1838,52 @@ if (now >= (h.stuckCheckAt || 0)) {
       // core
       ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, TAU);
       ctx.fillStyle = colors.bullet; ctx.fill();
-      ctx.strokeStyle = colors.shipOutline; ctx.stroke();
+    ctx.strokeStyle = colors.shipOutline; ctx.stroke();
+    }
+
+    // Bullets (round) with trails — draw before ship so ship covers trails
+    {
+      const br = (params.bulletSize ?? 3) / 2;
+      const trailBase = params.bulletTrailLen ?? 14;
+      const trailW = params.bulletTrailWidth ?? 2;
+      const trailSpMul = params.bulletTrailSpeedMult ?? 0.5;
+      for (const b of state.bullets) {
+        const sp = Math.hypot(b.vx, b.vy) || 1;
+        const dx = (b.vx || 0) / sp;
+        const dy = (b.vy || 0) / sp;
+        const len = trailBase + sp * trailSpMul;
+        const x2 = b.x - dx * len;
+        const y2 = b.y - dy * len;
+        // trail
+        const g = ctx.createLinearGradient(b.x, b.y, x2, y2);
+        const headCol = (colors.bullet || '#ffffff') + 'ee';
+        g.addColorStop(0, headCol);
+        g.addColorStop(1, '#0000');
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.strokeStyle = g;
+        ctx.lineWidth = trailW;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(b.x, b.y);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.restore();
+
+        // head
+        ctx.fillStyle = colors.bullet;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, br, 0, TAU);
+        ctx.fill();
+      }
     }
 
     // Ship (SVG with canvas effects fallback)
     ctx.save();
     ctx.translate(ship.x, ship.y);
     ctx.rotate(ship.a);
-    const inv = performance.now() < state.invulnUntil;
-    ctx.globalAlpha = inv ? 0.5 : 1;
+    const inv = now < state.invulnUntil;
+    ctx.globalAlpha = 1;
 
     // Engine plume behind hull (long rectangular gradient)
     const thrusting = state.keys.has('ArrowUp') || state.keys.has('KeyW');
@@ -1869,11 +1922,28 @@ if (now >= (h.stuckCheckAt || 0)) {
       ctx.strokeStyle = colors.shipOutline; ctx.stroke();
     }
     ctx.restore();
+    
+    // Invulnerability ring (blink) — draw around ship while invuln
+    if (inv) {
+      const baseR = (params.invulnRingScale ?? 1.9) * getShipHitR();
+      const period = params.invulnRingPulseMs ?? 900;
+      const phase = (now % period) / period;
+      const osc = Math.sin(phase * TAU);
+      const alpha = 0.25 + 0.35 * (0.5 + 0.5 * osc);
+      const R = baseR * (1 + (params.invulnRingPulseScale ?? 0.06) * osc);
+      const back = params.invulnRingBackPx ?? 0;
+      const cx = ship.x - Math.cos(ship.a) * back;
+      const cy = ship.y - Math.sin(ship.a) * back;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = colors.invulnRing || colors.engineFlame || '#ffa34d';
+      ctx.lineWidth = params.invulnRingWidth ?? 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, TAU);
+      ctx.stroke();
+      ctx.restore();
+    }
     ctx.globalAlpha = 1;
-
-    // Bullets
-    ctx.fillStyle = colors.bullet;
-    for (const b of state.bullets) ctx.fillRect(b.x - 1.5, b.y - 1.5, 3, 3);
 
     // Pause overlay
     if (!state.running) {
