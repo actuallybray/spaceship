@@ -101,6 +101,8 @@
     collectibles: [],
     shockwaves: [],
     //lasers: [],
+    blinkSmears: [],     // transient visual smear for blink path
+    blinkAfterImages: [], // trailing ship afterimages for blink
 
     collected: 0,
     keys: new Set(),
@@ -275,6 +277,14 @@
     // knockbackMult: 0.25,
 
     knockbackMult: 0.25,   // <— put this back (outside any commented block)
+
+    // Blink visuals
+    blinkDistance: 700,     // px distance to teleport
+    blinkSmearLifeMs: 140,
+    blinkSmearWidth: 2,      // core width; glow is wider
+    blinkAfterImageCount: 6,
+    blinkAfterImageLifeMs: 220,
+    blinkAfterImageAlpha: 0.75,
 
     // RCS visuals
     rcsPuffCooldown: 120,
@@ -866,23 +876,80 @@ function spawnOneCollectible() {
   const diry = Math.sin(ship.a);
 
 
-  // Shockwave if charged enough
+  // Blink forward instead of shockwave if charged enough
   if (power >= params.laserMinPower) {
-    const shockCost = params.bulletEnergyCost * params.laserEnergyCostMult;
-    if (!trySpendEnergy(shockCost)) { state.charging = false; return; }
+    const blinkCost = params.bulletEnergyCost * params.laserEnergyCostMult;
+    if (!trySpendEnergy(blinkCost)) { state.charging = false; return; }
 
-    state.shockwaves.push({
-      x: ship.x,
-      y: ship.y,
-      born: now,
-      duration: params.shockDuration,
-      startR: params.shockStartRadius,
-      endR: params.shockMaxRadius,
-      width: params.shockWidth,
-      power
-    });
+    const sx = ship.x, sy = ship.y;
+    const dist = params.blinkDistance ?? 300; // blink distance (px)
+    const ex = sx + dirx * dist;
+    const ey = sy + diry * dist;
 
-    // No knockback (force is radial + symmetric)
+    // Kill anything intersecting the blink path (thick segment)
+    const pathHalfW = 10; // half-width of the lethal path band
+
+    // Spheres (split like other kills)
+    for (let si = state.spheres.length - 1; si >= 0; si--) {
+      const s = state.spheres[si];
+      const r = s.r + pathHalfW;
+      if (lineCircleHit(sx, sy, ex, ey, s.x, s.y, r)) {
+        state.spheres.splice(si, 1);
+        burst(s.x, s.y, 14);
+        addScore(10 + Math.round(46 - s.r));
+        const newR = s.r * params.sphereSplitFactor;
+        if (newR > params.sphereMinR) {
+          const ang = rand(0, TAU);
+          const spd1 = rand(1.2, 2.6), spd2 = rand(1.2, 2.6);
+          state.spheres.push({ x: s.x, y: s.y, vx: Math.cos(ang)*spd1,        vy: Math.sin(ang)*spd1,        r: newR, m: newR*newR });
+          state.spheres.push({ x: s.x, y: s.y, vx: Math.cos(ang+Math.PI)*spd2, vy: Math.sin(ang+Math.PI)*spd2, r: newR, m: newR*newR });
+        }
+      }
+    }
+
+    // Hunters — instant kill if intersect path (respect spawn grace)
+    for (let hi = state.hunters.length - 1; hi >= 0; hi--) {
+      const h = state.hunters[hi];
+      if (now <= (h.spawnGraceUntil || 0)) continue;
+      const r = h.r + pathHalfW;
+      if (lineCircleHit(sx, sy, ex, ey, h.x, h.y, r)) {
+        state.hunters.splice(hi, 1);
+        burst(h.x, h.y, 16, colors.rcs);
+        addScore(params.hunterScore || 25);
+      }
+    }
+
+    // Tanks — instant kill if intersect path (respect spawn grace)
+    for (let ti = state.tanks.length - 1; ti >= 0; ti--) {
+      const tnk = state.tanks[ti];
+      if (now <= (tnk.spawnGraceUntil || 0)) continue;
+      const r = tnk.r + pathHalfW;
+      if (lineCircleHit(sx, sy, ex, ey, tnk.x, tnk.y, r)) {
+        state.tanks.splice(ti, 1);
+        burst(tnk.x, tnk.y, 16, colors.rcs);
+        addScore(params.tankScore || 60);
+      }
+    }
+
+    // Add a transient visual smear for the blink path
+    state.blinkSmears.push({ x1: sx, y1: sy, x2: ex, y2: ey, born: now, life: (params.blinkSmearLifeMs ?? 140) });
+
+    // Add trailing afterimages along the path (from end back to start)
+    {
+      const count = params.blinkAfterImageCount ?? 5;
+      const life = params.blinkAfterImageLifeMs ?? 220;
+      for (let i = 1; i <= count; i++) {
+        const t = i / (count + 1); // 0..1 from end back to start
+        const x = ex - dirx * (dist * t);
+        const y = ey - diry * (dist * t);
+        state.blinkAfterImages.push({ x, y, a: ship.a, born: now, life, alpha0: (params.blinkAfterImageAlpha ?? 0.85) * (1 - t*0.1) });
+      }
+    }
+
+    // Teleport ship to end point, then wrap
+    ship.x = ex; ship.y = ey;
+    hardWrap(ship, canvas.width / dpr(), canvas.height / dpr());
+
     state.charging = false;
     return;
   }
@@ -1546,6 +1613,18 @@ for (let i = 0; i < state.hunters.length; i++) {
     }
   }
 
+  // --- Blink smear lifetimes
+  for (let i = state.blinkSmears.length - 1; i >= 0; i--) {
+    const s = state.blinkSmears[i];
+    if (now - s.born > s.life) state.blinkSmears.splice(i, 1);
+  }
+
+  // --- Blink afterimage lifetimes
+  for (let i = state.blinkAfterImages.length - 1; i >= 0; i--) {
+    const g = state.blinkAfterImages[i];
+    if (now - g.born > g.life) state.blinkAfterImages.splice(i, 1);
+  }
+
   // --- Passive energy regen (slow, only after not firing for a bit) ---
   const dt = state.prevUpdateAt ? (now - state.prevUpdateAt) / 1000 : 0;
   state.prevUpdateAt = now;
@@ -1610,6 +1689,39 @@ for (let i = 0; i < state.hunters.length; i++) {
       ctx.shadowBlur = 12;
       ctx.fillText(state.waveMsg, (canvas.width / dpr()) / 2, (canvas.height / dpr()) / 2);
       ctx.restore();
+    }
+
+    // Blink smears (fast fade line with glow) — wrap-aware rendering with viewport culling
+    if (state.blinkSmears.length) {
+      for (const S of state.blinkSmears) {
+        const t = clamp((now - S.born) / (S.life || 1), 0, 1);
+        const fade = 1 - t;
+        const width = (params.blinkSmearWidth ?? 20) * (0.8 + 0.2 * fade);
+        const xOffsets = [-w, 0, w];
+        const yOffsets = [-h, 0, h];
+        for (const ox of xOffsets) for (const oy of yOffsets) {
+          const x1o = S.x1 + ox, y1o = S.y1 + oy;
+          const x2o = S.x2 + ox, y2o = S.y2 + oy;
+          const minx = Math.min(x1o, x2o), maxx = Math.max(x1o, x2o);
+          const miny = Math.min(y1o, y2o), maxy = Math.max(y1o, y2o);
+          const margin = width * 2.2; // account for glow pass thickness
+          if (maxx < -margin || maxy < -margin || minx > w + margin || miny > h + margin) continue;
+          // glow pass
+          ctx.save();
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.lineCap = 'round';
+          ctx.strokeStyle = colors.rcs;
+          ctx.globalAlpha = 0.35 * fade;
+          ctx.lineWidth = width * 2.2;
+          ctx.beginPath(); ctx.moveTo(x1o, y1o); ctx.lineTo(x2o, y2o); ctx.stroke();
+          // core pass
+          ctx.strokeStyle = colors.bullet;
+          ctx.globalAlpha = 0.9 * fade;
+          ctx.lineWidth = width;
+          ctx.beginPath(); ctx.moveTo(x1o, y1o); ctx.lineTo(x2o, y2o); ctx.stroke();
+          ctx.restore();
+        }
+      }
     }
 
     // RCS pulses anchored to ship (fade over life)
@@ -1875,6 +1987,46 @@ if (now >= (h.stuckCheckAt || 0)) {
         ctx.beginPath();
         ctx.arc(b.x, b.y, br, 0, TAU);
         ctx.fill();
+      }
+    }
+
+    // Blink afterimages — draw ghost copies along the recent blink path (wrap-aware, culled)
+    if (state.blinkAfterImages.length) {
+      const xOffsets = [-w, 0, w];
+      const yOffsets = [-h, 0, h];
+      for (const g of state.blinkAfterImages) {
+        const t = clamp((now - g.born) / (g.life || 1), 0, 1);
+        const alpha = (g.alpha0 || 0.7) * (1 - t);
+        if (alpha <= 0) continue;
+        for (const ox of xOffsets) for (const oy of yOffsets) {
+          const cx = g.x + ox, cy = g.y + oy;
+          // conservative bounds for culling
+          let halfW, halfH;
+          if (shipImgReady) {
+            const s = ship.r / 12;
+            halfW = (shipImgW * s) / 2;
+            halfH = (shipImgH * s) / 2;
+          } else {
+            halfW = 16; halfH = 16;
+          }
+          const margin = Math.max(halfW, halfH) + 6;
+          if (cx + margin < 0 || cy + margin < 0 || cx - margin > w || cy - margin > h) continue;
+          ctx.save();
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.globalAlpha = alpha;
+          ctx.translate(cx, cy);
+          ctx.rotate(g.a || 0);
+          if (shipImgReady) {
+            const s = ship.r / 12;
+            ctx.scale(s, s);
+            ctx.drawImage(shipImg, -shipImgW / 2, -shipImgH / 2, shipImgW, shipImgH);
+          } else {
+            ctx.beginPath();
+            ctx.moveTo(14, 0); ctx.lineTo(-12, -9); ctx.lineTo(-6, 0); ctx.lineTo(-12, 9); ctx.closePath();
+            ctx.fillStyle = colors.ship; ctx.fill();
+          }
+          ctx.restore();
+        }
       }
     }
 
